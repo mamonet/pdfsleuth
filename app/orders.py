@@ -1,12 +1,16 @@
 # app/orders.py
-"""Order state machine. v3: cancel and reject terminal paths.
+"""Order state machine. final: confirmed-terminal handling.
 
-v2 handled the happy path but had no way to actually cancel or reject an order,
-and no notion of a cancel that races a fill. v3 adds:
-  - mark_cancelled / mark_rejected with the reason recorded
-  - a partially-filled cancel keeps the filled qty, it does not unwind it
-  - a cancel that arrives after the order already completed is a no-op, not an error,
-    because the venue and our stream can legitimately cross
+DEFECT in v3: mark_cancelled/mark_rejected flipped the order to a terminal state on
+the strength of a local event alone. If we assumed CANCELLED after firing a cancel
+and the connection then dropped before the venue confirmed, the order could still be
+live at the venue, keep filling, and strand us in a terminal state we made up. The
+reconciler would then compare against a position that never stopped moving.
+
+FIX: separate LOCAL intent from BROKER-CONFIRMED truth. A terminal state is only
+trusted (terminal_confirmed=True) once query_order returns it from the broker. Until
+then the order sits in a pending-terminal state that still accepts late fills and
+still gets re-queried. confirm_terminal() is the only path that sets the trusted flag.
 """
 
 from __future__ import annotations
@@ -30,9 +34,10 @@ LEGAL_TRANSITIONS: Dict[OrderStatus, FrozenSet[OrderStatus]] = {
     OrderStatus.PARTIALLY_FILLED: frozenset({
         OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED, OrderStatus.CANCELLED,
     }),
-    OrderStatus.FILLED: frozenset(),
-    OrderStatus.CANCELLED: frozenset(),
-    OrderStatus.REJECTED: frozenset(),
+    # Terminal states keep a self-edge so a broker re-confirmation is not an illegal move.
+    OrderStatus.FILLED: frozenset({OrderStatus.FILLED}),
+    OrderStatus.CANCELLED: frozenset({OrderStatus.CANCELLED, OrderStatus.FILLED}),
+    OrderStatus.REJECTED: frozenset({OrderStatus.REJECTED}),
 }
 
 TERMINAL = (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED)
@@ -75,11 +80,14 @@ def mark_working(order: Order) -> Order:
 
 
 def apply_fill(order: Order, fill: Fill) -> Order:
+    """Accumulate a fill. Accepts late fills even against a locally-assumed terminal
+    state, as long as that state is not yet broker-confirmed. This is exactly the
+    dropped-cancel case the fix exists for.
+    """
     if fill.order_id != order.order_id:
         raise ValueError(f"fill {fill.fill_id} is for a different order")
-    if order.status in (OrderStatus.CANCELLED, OrderStatus.REJECTED):
-        # A fill against a cancelled order means the cancel lost the race at the venue.
-        # Refusing it here would drop a real execution, so surface it loudly instead.
+    if order.terminal_confirmed:
+        # Broker has confirmed done. A fill after that is a genuine anomaly.
         raise IllegalTransition(order.order_id, order.status, OrderStatus.PARTIALLY_FILLED)
 
     new_filled = order.filled_qty + fill.qty
@@ -93,37 +101,75 @@ def apply_fill(order: Order, fill: Fill) -> Order:
     order.filled_qty = new_filled
     order.fees += fill.fee
 
+    # From a locally-assumed CANCELLED, a late fill re-opens the order. Route it back
+    # through PARTIALLY_FILLED/FILLED rather than trusting the stale terminal.
+    if order.status is OrderStatus.CANCELLED:
+        order.status = OrderStatus.FILLED if order.is_complete else OrderStatus.PARTIALLY_FILLED
+        order.touch()
+        return order
+
     target = OrderStatus.FILLED if order.is_complete else OrderStatus.PARTIALLY_FILLED
     transition(order, target)
     return order
 
 
-def mark_cancelled(order: Order, reason: Optional[str] = None) -> Order:
-    """Cancel. Any qty already filled stays filled; only the remainder dies.
-
-    Idempotent against a completed order: if it filled first, the cancel simply lost.
+def mark_cancelled(order: Order, reason: Optional[str] = None, confirmed: bool = False) -> Order:
+    """Request/observe a cancel. confirmed=False means WE assumed it (fired the cancel,
+    lost the connection); the state is provisional and stays re-queryable. confirmed=True
+    means the broker reported it. Only the latter is trusted as final.
     """
-    if order.status is OrderStatus.FILLED:
-        return order  # cancel raced a complete fill and lost
-    if order.status is OrderStatus.CANCELLED:
-        return order  # duplicate cancel ack
-    transition(order, OrderStatus.CANCELLED)
+    if order.status is OrderStatus.FILLED and order.terminal_confirmed:
+        return order
+    if order.status is not OrderStatus.CANCELLED:
+        transition(order, OrderStatus.CANCELLED)
     if reason:
         order.reject_reason = reason
+    if confirmed:
+        order.terminal_confirmed = True
     return order
 
 
-def mark_rejected(order: Order, reason: str) -> Order:
-    """Reject is terminal and carries a reason. Never retried (see retry.py)."""
-    if order.status is OrderStatus.REJECTED:
+def mark_rejected(order: Order, reason: str, confirmed: bool = True) -> Order:
+    """Reject. A reject only ever comes FROM the broker, so it is confirmed by default."""
+    if order.terminal_confirmed and order.status is OrderStatus.REJECTED:
         return order
     if order.filled_qty > ZERO:
-        # A venue does not reject an order it has already partially executed.
         raise IllegalTransition(order.order_id, order.status, OrderStatus.REJECTED)
-    transition(order, OrderStatus.REJECTED)
+    if order.status is not OrderStatus.REJECTED:
+        transition(order, OrderStatus.REJECTED)
     order.reject_reason = reason
+    order.terminal_confirmed = confirmed
+    return order
+
+
+def confirm_terminal(order: Order, broker_status: OrderStatus) -> Order:
+    """Apply a status straight from query_order and mark it trusted.
+
+    This is the ONLY function that sets terminal_confirmed on a fill/cancel. If the
+    broker says the order is still open, we drop any local terminal assumption.
+    """
+    if broker_status.is_open:
+        # Broker disagrees with our assumed-terminal; believe the broker.
+        if order.status.is_terminal and not order.terminal_confirmed:
+            order.status = broker_status
+            order.terminal_confirmed = False
+            order.touch()
+        return order
+
+    if order.status != broker_status:
+        # Force to the broker's terminal even if our local edge would not allow it;
+        # the broker is authoritative here.
+        order.status = broker_status
+        order.touch()
+    order.terminal_confirmed = True
     return order
 
 
 def is_terminal(order: Order) -> bool:
-    return order.status in TERMINAL
+    """Trusted-terminal only. A locally-assumed terminal is NOT terminal yet."""
+    return order.status in TERMINAL and order.terminal_confirmed
+
+
+def needs_confirmation(order: Order) -> bool:
+    """True when the order looks terminal locally but the broker has not confirmed."""
+    return order.status in TERMINAL and not order.terminal_confirmed
