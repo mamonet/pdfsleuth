@@ -1,8 +1,10 @@
 # app/pnl.py
-"""P&L from the fill ledger. v1: realized + unrealized on average cost.
+"""P&L from the fill ledger. v2: pluggable cost basis (average vs FIFO).
 
-Realized P&L accrues as positions close; unrealized is the open position marked to a
-supplied price. This version hardcodes average cost and takes marks as a plain dict.
+v1 was welded to average cost via PositionBook. v2 routes each symbol's fills through
+a costbasis strategy chosen by config, so realized P&L follows the configured method.
+The per-symbol CostBasis object holds qty, avg_cost and realized; we mark the open qty
+to compute unrealized.
 """
 
 from __future__ import annotations
@@ -11,8 +13,9 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Dict, Iterable, List
 
-from app.models import Fill, Position, ZERO
-from app.positions import PositionBook
+from app.config import CostBasisMethod
+from app.costbasis import CostBasis, make_cost_basis
+from app.models import Fill, ZERO
 
 
 @dataclass
@@ -47,26 +50,35 @@ class PnlReport:
 
 
 class PnlEngine:
-    def __init__(self) -> None:
-        self._book = PositionBook()
+    def __init__(self, method: CostBasisMethod = CostBasisMethod.AVERAGE) -> None:
+        self._method = method
+        self._basis: Dict[str, CostBasis] = {}
+
+    def _for(self, symbol: str) -> CostBasis:
+        cb = self._basis.get(symbol)
+        if cb is None:
+            cb = make_cost_basis(self._method, symbol)
+            self._basis[symbol] = cb
+        return cb
 
     def apply(self, fill: Fill) -> None:
-        self._book.apply(fill)
+        self._for(fill.symbol).apply(fill)
 
     def apply_many(self, fills: Iterable[Fill]) -> None:
         for f in fills:
-            self._book.apply(f)
+            self.apply(f)
 
     def report(self, marks: Dict[str, Decimal]) -> PnlReport:
         lines: List[PnlLine] = []
-        for pos in self._book.all():
-            mark = marks.get(pos.symbol, pos.avg_cost)
+        for symbol, cb in self._basis.items():
+            mark = marks.get(symbol, cb.avg_cost)
+            unrealized = (mark - cb.avg_cost) * cb.qty  # qty carries sign
             lines.append(PnlLine(
-                symbol=pos.symbol,
-                qty=pos.qty,
-                avg_cost=pos.avg_cost,
+                symbol=symbol,
+                qty=cb.qty,
+                avg_cost=cb.avg_cost,
                 mark=mark,
-                realized=pos.realized_pnl,
-                unrealized=pos.unrealized(mark),
+                realized=cb.realized_pnl,
+                unrealized=unrealized,
             ))
         return PnlReport(lines)
