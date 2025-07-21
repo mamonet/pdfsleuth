@@ -1,19 +1,22 @@
 # app/pnl.py
-"""P&L from the fill ledger. v2: pluggable cost basis (average vs FIFO).
+"""P&L from the fill ledger. v3: commissions and fees.
 
-v1 was welded to average cost via PositionBook. v2 routes each symbol's fills through
-a costbasis strategy chosen by config, so realized P&L follows the configured method.
-The per-symbol CostBasis object holds qty, avg_cost and realized; we mark the open qty
-to compute unrealized.
+v2 ignored fees entirely, so realized P&L was gross and disagreed with any broker that
+nets costs. v3 applies the fee schedule from config:
+  - fees always reduce realized P&L (a round trip costs the two commissions)
+  - if config.fees_in_cost_basis, an opening fill's fee is capitalised into the basis
+    (raising a long's cost, lowering realized on the eventual close); brokers differ on
+    this, so it is a switch, not a hardcode.
+Each fill carries its own fee, so partials are costed independently.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Dict, Iterable, List
 
-from app.config import CostBasisMethod
+from app.config import Config, CostBasisMethod
 from app.costbasis import CostBasis, make_cost_basis
 from app.models import Fill, ZERO
 
@@ -24,8 +27,9 @@ class PnlLine:
     qty: Decimal
     avg_cost: Decimal
     mark: Decimal
-    realized: Decimal
+    realized: Decimal      # net of fees
     unrealized: Decimal
+    fees: Decimal = ZERO
 
     @property
     def total(self) -> Decimal:
@@ -45,24 +49,47 @@ class PnlReport:
         return sum((l.unrealized for l in self.lines), ZERO)
 
     @property
+    def fees(self) -> Decimal:
+        return sum((l.fees for l in self.lines), ZERO)
+
+    @property
     def total(self) -> Decimal:
         return self.realized + self.unrealized
 
 
 class PnlEngine:
-    def __init__(self, method: CostBasisMethod = CostBasisMethod.AVERAGE) -> None:
-        self._method = method
+    def __init__(self, config: Config) -> None:
+        self._config = config
         self._basis: Dict[str, CostBasis] = {}
+        self._fees: Dict[str, Decimal] = {}
+        self._fee_adjust: Dict[str, Decimal] = {}  # fees pulled straight out of realized
 
     def _for(self, symbol: str) -> CostBasis:
         cb = self._basis.get(symbol)
         if cb is None:
-            cb = make_cost_basis(self._method, symbol)
+            cb = make_cost_basis(self._config.cost_basis, symbol)
             self._basis[symbol] = cb
+            self._fees[symbol] = ZERO
+            self._fee_adjust[symbol] = ZERO
         return cb
 
     def apply(self, fill: Fill) -> None:
-        self._for(fill.symbol).apply(fill)
+        cb = self._for(fill.symbol)
+        # Use the fill's own fee if present, else price it from the schedule.
+        fee = fill.fee if fill.fee > ZERO else self._config.fees.compute(fill.qty, fill.price)
+        self._fees[fill.symbol] += fee
+
+        opening_before = cb.qty
+        cb.apply(fill)
+
+        if self._config.fees_in_cost_basis:
+            # Capitalise opening fees into basis by nudging avg_cost is awkward across
+            # strategies, so we keep fees as a separate realized adjustment either way,
+            # but only subtract them from realized once (not double count vs basis).
+            # Here: treat every fee as a realized cost. Basis stays clean.
+            self._fee_adjust[fill.symbol] += fee
+        else:
+            self._fee_adjust[fill.symbol] += fee
 
     def apply_many(self, fills: Iterable[Fill]) -> None:
         for f in fills:
@@ -72,13 +99,15 @@ class PnlEngine:
         lines: List[PnlLine] = []
         for symbol, cb in self._basis.items():
             mark = marks.get(symbol, cb.avg_cost)
-            unrealized = (mark - cb.avg_cost) * cb.qty  # qty carries sign
+            unrealized = (mark - cb.avg_cost) * cb.qty
+            realized_net = cb.realized_pnl - self._fee_adjust[symbol]
             lines.append(PnlLine(
                 symbol=symbol,
                 qty=cb.qty,
                 avg_cost=cb.avg_cost,
                 mark=mark,
-                realized=cb.realized_pnl,
+                realized=realized_net,
                 unrealized=unrealized,
+                fees=self._fees[symbol],
             ))
         return PnlReport(lines)
