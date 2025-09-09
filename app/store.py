@@ -1,13 +1,15 @@
 # app/store.py
 """SQLite persistence. Decimal in, TEXT on disk, Decimal out. No floats near prices.
 
-v2: read/write for orders and fills, and restart recovery that reloads open state so the
-engine can resume where it left off.
+final: atomic writes. A single fill changes three things at once (the fill ledger, the
+order's filled_qty/status, the position). Those must land together or not at all, otherwise
+a crash mid-write leaves a half-applied fill: money moved on the ledger but the position
+never updated, or vice versa. apply_fill() wraps all of it in one transaction, and WAL mode
+makes the commit atomic and durable. Recovery reloads open state on restart.
 """
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from datetime import datetime
 from decimal import Decimal
@@ -85,14 +87,19 @@ def _iso(dt: datetime) -> str:
 
 
 class Store:
-    def __init__(self, path: str = ":memory:"):
+    def __init__(self, path: str = ":memory:", wal: bool = True):
         self.path = path
+        self.wal = wal
         self.conn: Optional[sqlite3.Connection] = None
 
     def open(self) -> "Store":
-        self.conn = sqlite3.connect(self.path)
+        # isolation_level="" lets us manage transactions explicitly with BEGIN/COMMIT.
+        self.conn = sqlite3.connect(self.path, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON;")
+        if self.wal and self.path != ":memory:":
+            self.conn.execute("PRAGMA journal_mode=WAL;")
+            self.conn.execute("PRAGMA synchronous=NORMAL;")
         return self
 
     def init(self) -> "Store":
@@ -100,7 +107,6 @@ class Store:
             self.open()
         assert self.conn is not None
         self.conn.executescript(SCHEMA)
-        self.conn.commit()
         return self
 
     def close(self) -> None:
@@ -114,10 +120,93 @@ class Store:
     def __exit__(self, *exc) -> None:
         self.close()
 
-    # --- writes --------------------------------------------------------------
+    # --- atomic state changes ------------------------------------------------
+
+    def apply_fill(self, fill: Fill, order: Order, position: Position) -> bool:
+        """Record a fill and the order+position it produced, all in one transaction.
+
+        Returns False (and writes nothing) if broker_exec_id was already applied, so a
+        replayed stream can call this blindly and stay idempotent. Any error inside rolls
+        the whole thing back: no half-applied fill.
+        """
+        assert self.conn is not None
+        cur = self.conn.cursor()
+        try:
+            cur.execute("BEGIN IMMEDIATE;")
+            if fill.broker_exec_id is not None:
+                seen = cur.execute(
+                    "SELECT 1 FROM fills WHERE broker_exec_id=?", (fill.broker_exec_id,)
+                ).fetchone()
+                if seen:
+                    cur.execute("ROLLBACK;")
+                    return False
+            self._insert_fill(cur, fill)
+            self._write_order(cur, order)
+            self._write_position(cur, position)
+            self._log(cur, "FILL", fill.fill_id, fill.broker_exec_id or "")
+            cur.execute("COMMIT;")
+            return True
+        except Exception:
+            cur.execute("ROLLBACK;")
+            raise
 
     def upsert_order(self, o: Order) -> None:
-        self.conn.execute(
+        """Standalone order write (submit/ack/reject), its own transaction."""
+        assert self.conn is not None
+        cur = self.conn.cursor()
+        cur.execute("BEGIN IMMEDIATE;")
+        try:
+            self._write_order(cur, o)
+            self._log(cur, "ORDER", o.order_id, o.status.value)
+            cur.execute("COMMIT;")
+        except Exception:
+            cur.execute("ROLLBACK;")
+            raise
+
+    def upsert_position(self, p: Position) -> None:
+        assert self.conn is not None
+        cur = self.conn.cursor()
+        cur.execute("BEGIN IMMEDIATE;")
+        try:
+            self._write_position(cur, p)
+            cur.execute("COMMIT;")
+        except Exception:
+            cur.execute("ROLLBACK;")
+            raise
+
+    def record_fill(self, f: Fill) -> bool:
+        """Fill-only insert (used when the caller updates order/position separately)."""
+        assert self.conn is not None
+        cur = self.conn.cursor()
+        cur.execute("BEGIN IMMEDIATE;")
+        try:
+            if f.broker_exec_id is not None:
+                if cur.execute("SELECT 1 FROM fills WHERE broker_exec_id=?",
+                               (f.broker_exec_id,)).fetchone():
+                    cur.execute("ROLLBACK;")
+                    return False
+            self._insert_fill(cur, f)
+            self._log(cur, "FILL", f.fill_id, f.broker_exec_id or "")
+            cur.execute("COMMIT;")
+            return True
+        except Exception:
+            cur.execute("ROLLBACK;")
+            raise
+
+    # --- raw statements (no commit; caller owns the transaction) -------------
+
+    @staticmethod
+    def _insert_fill(cur: sqlite3.Cursor, f: Fill) -> None:
+        cur.execute(
+            """INSERT INTO fills (fill_id, broker_exec_id, order_id, symbol, side, qty,
+                    price, fee, ts) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (f.fill_id, f.broker_exec_id, f.order_id, f.symbol, f.side.value,
+             _d(f.qty), _d(f.price), _d(f.fee), _iso(f.ts)),
+        )
+
+    @staticmethod
+    def _write_order(cur: sqlite3.Cursor, o: Order) -> None:
+        cur.execute(
             """INSERT INTO orders (order_id, client_order_id, broker_order_id, symbol, side,
                     qty, order_type, limit_price, status, filled_qty, avg_fill_price, fees,
                     reject_reason, terminal_confirmed, created_at, updated_at)
@@ -132,30 +221,15 @@ class Store:
                     terminal_confirmed=excluded.terminal_confirmed,
                     updated_at=excluded.updated_at""",
             (o.order_id, o.client_order_id, o.broker_order_id, o.symbol, o.side.value,
-             _d(o.qty), o.order_type.value, (_d(o.limit_price) if o.limit_price is not None else None),
+             _d(o.qty), o.order_type.value,
+             (_d(o.limit_price) if o.limit_price is not None else None),
              o.status.value, _d(o.filled_qty), _d(o.avg_fill_price), _d(o.fees),
              o.reject_reason, int(o.terminal_confirmed), _iso(o.created_at), _iso(o.updated_at)),
         )
-        self._log("ORDER", o.order_id, o.status.value)
-        self.conn.commit()
 
-    def record_fill(self, f: Fill) -> bool:
-        """Insert a fill. Returns False if broker_exec_id already seen (dup replay)."""
-        try:
-            self.conn.execute(
-                """INSERT INTO fills (fill_id, broker_exec_id, order_id, symbol, side, qty,
-                        price, fee, ts) VALUES (?,?,?,?,?,?,?,?,?)""",
-                (f.fill_id, f.broker_exec_id, f.order_id, f.symbol, f.side.value,
-                 _d(f.qty), _d(f.price), _d(f.fee), _iso(f.ts)),
-            )
-        except sqlite3.IntegrityError:
-            return False
-        self._log("FILL", f.fill_id, f.broker_exec_id or "")
-        self.conn.commit()
-        return True
-
-    def upsert_position(self, p: Position) -> None:
-        self.conn.execute(
+    @staticmethod
+    def _write_position(cur: sqlite3.Cursor, p: Position) -> None:
+        cur.execute(
             """INSERT INTO positions (symbol, qty, avg_cost, realized_pnl, fees_paid, updated_at)
                VALUES (?,?,?,?,?,?)
                ON CONFLICT(symbol) DO UPDATE SET
@@ -165,10 +239,10 @@ class Store:
             (p.symbol, _d(p.qty), _d(p.avg_cost), _d(p.realized_pnl), _d(p.fees_paid),
              _iso(p.updated_at)),
         )
-        self.conn.commit()
 
-    def _log(self, kind: str, ref_id: str, detail: str) -> None:
-        self.conn.execute(
+    @staticmethod
+    def _log(cur: sqlite3.Cursor, kind: str, ref_id: str, detail: str) -> None:
+        cur.execute(
             "INSERT INTO trade_history (ts, kind, ref_id, detail) VALUES (?,?,?,?)",
             (datetime.utcnow().isoformat(), kind, ref_id, detail),
         )
@@ -181,6 +255,10 @@ class Store:
     def load_open_orders(self) -> List[Order]:
         q = "SELECT * FROM orders WHERE status IN (%s)" % ",".join("?" * len(OPEN_STATUSES))
         return [self._row_to_order(r) for r in self.conn.execute(q, OPEN_STATUSES)]
+
+    def get_order(self, order_id: str) -> Optional[Order]:
+        r = self.conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
+        return self._row_to_order(r) if r else None
 
     def load_fills(self, order_id: Optional[str] = None) -> List[Fill]:
         if order_id:
@@ -196,18 +274,17 @@ class Store:
 
     @staticmethod
     def _row_to_order(r: sqlite3.Row) -> Order:
-        o = Order(
+        return Order(
             symbol=r["symbol"], side=Side(r["side"]), qty=Decimal(r["qty"]),
-            order_type=OrderType(r["order_type"]),
-            limit_price=_dec(r["limit_price"]), order_id=r["order_id"],
-            client_order_id=r["client_order_id"], broker_order_id=r["broker_order_id"],
-            status=OrderStatus(r["status"]), filled_qty=Decimal(r["filled_qty"]),
-            avg_fill_price=Decimal(r["avg_fill_price"]), fees=Decimal(r["fees"]),
-            reject_reason=r["reject_reason"], terminal_confirmed=bool(r["terminal_confirmed"]),
+            order_type=OrderType(r["order_type"]), limit_price=_dec(r["limit_price"]),
+            order_id=r["order_id"], client_order_id=r["client_order_id"],
+            broker_order_id=r["broker_order_id"], status=OrderStatus(r["status"]),
+            filled_qty=Decimal(r["filled_qty"]), avg_fill_price=Decimal(r["avg_fill_price"]),
+            fees=Decimal(r["fees"]), reject_reason=r["reject_reason"],
+            terminal_confirmed=bool(r["terminal_confirmed"]),
             created_at=datetime.fromisoformat(r["created_at"]),
             updated_at=datetime.fromisoformat(r["updated_at"]),
         )
-        return o
 
     @staticmethod
     def _row_to_fill(r: sqlite3.Row) -> Fill:
