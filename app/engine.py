@@ -1,9 +1,11 @@
 # app/engine.py
-"""Engine. v1: owns orders + positions, submits via the broker interface, applies fills.
+"""Engine. v2: oversell guard.
 
-The engine talks ONLY to the Broker adapter interface (app.brokers.base), never a
-concrete broker. It holds the order book and the position/P&L state and is the single
-place fills are folded in. All broker calls are async, matching the adapter surface.
+v1 would happily submit a sell larger than the position held, letting the book go
+short by accident. v2 tracks net qty per symbol and rejects a sell whose size exceeds
+the current long position BEFORE it reaches the broker. Open sell orders reserve their
+qty so two sells cannot each pass the guard against the same shares. (Deliberate
+shorting would be an explicit config, not this accidental path.)
 """
 
 from __future__ import annotations
@@ -12,11 +14,20 @@ from decimal import Decimal
 from typing import Dict, Optional
 
 from app import orders
-from app.brokers.base import Broker, OrderAck   # interface only, never a concrete broker
+from app.brokers.base import Broker, OrderAck
 from app.config import Config
 from app.idempotency import IdempotencyRegistry, derive_key
-from app.models import Fill, Order, OrderStatus, OrderType, Side
+from app.models import Fill, Order, OrderStatus, OrderType, Side, ZERO
 from app.pnl import PnlEngine
+from app.positions import PositionBook
+
+
+class OversellError(Exception):
+    def __init__(self, symbol: str, held: Decimal, requested: Decimal):
+        self.symbol = symbol
+        self.held = held
+        self.requested = requested
+        super().__init__(f"{symbol}: sell {requested} exceeds available {held}")
 
 
 class Engine:
@@ -25,17 +36,31 @@ class Engine:
         self._config = config
         self._orders: Dict[str, Order] = {}
         self._pnl = PnlEngine(config)
+        self._positions = PositionBook()
         self._idem = IdempotencyRegistry()
-        self._seen_execs: set[str] = set()   # broker_exec_id dedupe for the fill stream
+        self._seen_execs: set[str] = set()
 
-    # --- orders ---------------------------------------------------------------
+    def _held(self, symbol: str) -> Decimal:
+        return self._positions.get(symbol).qty
+
+    def _reserved_sells(self, symbol: str) -> Decimal:
+        total = ZERO
+        for o in self._orders.values():
+            if o.symbol == symbol and o.side is Side.SELL and o.status.is_open:
+                total += o.remaining_qty
+        return total
+
     async def submit(self, symbol: str, side: Side, qty: Decimal,
                      order_type: OrderType = OrderType.MARKET,
                      limit_price: Optional[Decimal] = None, nonce: str = "") -> Order:
+        if side is Side.SELL:
+            available = self._held(symbol) - self._reserved_sells(symbol)
+            if qty > available:
+                raise OversellError(symbol, available, qty)
+
         key = derive_key(symbol, side.value, qty, order_type.value, limit_price, nonce)
         existing = self._idem.get(key)
         if existing is not None:
-            # Duplicate submit: return the order we already have, do not re-send.
             return self._orders[existing.order_id]
 
         order = Order(symbol=symbol, side=side, qty=qty,
@@ -55,7 +80,6 @@ class Engine:
         return order
 
     def _apply_ack(self, order: Order, ack: OrderAck) -> None:
-        """Fold a broker ack into the order's state machine."""
         if order.broker_order_id is None:
             order.broker_order_id = ack.broker_order_id
         if order.status is OrderStatus.NEW:
@@ -63,17 +87,16 @@ class Engine:
         if ack.status is OrderStatus.CANCELLED:
             orders.mark_cancelled(order)
 
-    # --- fills ----------------------------------------------------------------
     def on_fill(self, fill: Fill) -> None:
         if fill.broker_exec_id and fill.broker_exec_id in self._seen_execs:
-            return  # at-least-once stream replay; already applied
+            return
         if fill.broker_exec_id:
             self._seen_execs.add(fill.broker_exec_id)
         order = self._orders[fill.order_id]
         orders.apply_fill(order, fill)
+        self._positions.apply(fill)
         self._pnl.apply(fill)
 
-    # --- reads ----------------------------------------------------------------
     def get_order(self, order_id: str) -> Order:
         return self._orders[order_id]
 
