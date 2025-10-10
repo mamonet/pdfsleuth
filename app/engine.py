@@ -1,11 +1,11 @@
 # app/engine.py
-"""Engine. v2: oversell guard.
+"""Engine. v3: persist through the store interface on every state change.
 
-v1 would happily submit a sell larger than the position held, letting the book go
-short by accident. v2 tracks net qty per symbol and rejects a sell whose size exceeds
-the current long position BEFORE it reaches the broker. Open sell orders reserve their
-qty so two sells cannot each pass the guard against the same shares. (Deliberate
-shorting would be an explicit config, not this accidental path.)
+v2 held all state in memory, so a restart lost every order, fill and position. v3
+writes through the Store interface (SQLite behind it) on each mutation: on submit, on
+every status change, and on every fill. State is rehydrated with load(), which replays
+the fill ledger rather than trusting a stale position snapshot. The engine depends on
+the Store interface only, not on sqlite directly.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from app.idempotency import IdempotencyRegistry, derive_key
 from app.models import Fill, Order, OrderStatus, OrderType, Side, ZERO
 from app.pnl import PnlEngine
 from app.positions import PositionBook
+from app.store import Store
 
 
 class OversellError(Exception):
@@ -31,14 +32,30 @@ class OversellError(Exception):
 
 
 class Engine:
-    def __init__(self, broker: Broker, config: Config) -> None:
+    def __init__(self, broker: Broker, config: Config, store: Store) -> None:
         self._broker = broker
         self._config = config
+        self._store = store
         self._orders: Dict[str, Order] = {}
         self._pnl = PnlEngine(config)
         self._positions = PositionBook()
         self._idem = IdempotencyRegistry()
         self._seen_execs: set[str] = set()
+
+    def load(self) -> None:
+        """Rehydrate from the store after a restart. Replays the fill ledger so
+        positions and P&L are rebuilt deterministically.
+        """
+        for order in self._store.load_orders():
+            self._orders[order.order_id] = order
+            if order.client_order_id:
+                self._idem.reserve(order.client_order_id, order)
+                self._idem.mark_sent(order.client_order_id)
+        for fill in self._store.load_fills():
+            if fill.broker_exec_id:
+                self._seen_execs.add(fill.broker_exec_id)
+            self._positions.apply(fill)
+            self._pnl.apply(fill)
 
     def _held(self, symbol: str) -> Decimal:
         return self._positions.get(symbol).qty
@@ -67,16 +84,19 @@ class Engine:
                       order_type=order_type, limit_price=limit_price)
         self._idem.reserve(key, order)
         self._orders[order.order_id] = order
+        self._store.upsert_order(order)   # persist NEW before we send
 
         ack = await self._broker.submit(order)
         self._apply_ack(order, ack)
         self._idem.mark_sent(key)
+        self._store.upsert_order(order)   # persist SUBMITTED
         return order
 
     async def cancel(self, order_id: str) -> Order:
         order = self._orders[order_id]
         ack = await self._broker.cancel(order.broker_order_id)
         self._apply_ack(order, ack)
+        self._store.upsert_order(order)
         return order
 
     def _apply_ack(self, order: Order, ack: OrderAck) -> None:
@@ -96,6 +116,10 @@ class Engine:
         orders.apply_fill(order, fill)
         self._positions.apply(fill)
         self._pnl.apply(fill)
+        # Persist the fill and the derived order/position state.
+        self._store.record_fill(fill)
+        self._store.upsert_order(order)
+        self._store.upsert_position(self._positions.get(fill.symbol))
 
     def get_order(self, order_id: str) -> Order:
         return self._orders[order_id]
