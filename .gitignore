@@ -1,0 +1,15 @@
+# byte-compiled / caches
+__pycache__/
+.pytest_cache/
+
+# virtualenv
+.venv/
+
+# sqlite databases and WAL sidecars
+*.db
+*.sqlite3
+*.db-wal
+*.db-shm
+
+# local env / secrets (never commit credentials)
+.env
